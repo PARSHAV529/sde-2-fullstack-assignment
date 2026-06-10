@@ -111,12 +111,13 @@ scheduledEmailRouter.use(requireAuth);
 scheduledEmailRouter.get('/:id', async (req: AuthedRequest, res) => {
   const id = Number(req.params.id);
   const [rows] = await pool.execute<RowDataPacket[]>(
-    `SELECT id, sequence_id, step_id, prospect_id, mailbox_id, scheduled_at,
-            status, attempts, last_error, sent_at
-       FROM scheduled_emails
-      WHERE id = ?
+    `SELECT se.id, se.sequence_id, se.step_id, se.prospect_id, se.mailbox_id, se.scheduled_at,
+            se.status, se.attempts, se.last_error, se.sent_at
+       FROM scheduled_emails se
+       JOIN sequences s ON s.id = se.sequence_id
+      WHERE se.id = ? AND s.user_id = ?
       LIMIT 1`,
-    [id],
+    [id, req.userId!],
   );
   if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
   res.json(rows[0]);

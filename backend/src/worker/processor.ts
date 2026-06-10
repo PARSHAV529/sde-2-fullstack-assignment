@@ -51,6 +51,17 @@ export async function processSendJob(job: Job<SendJob>): Promise<void> {
   if (row.status !== 'pending') {
     return;
   }
+
+  // BUG FIX: Check if the sequence has been paused. In-flight jobs that were
+  // already dequeued from BullMQ should respect the pause immediately.
+  if (row.sequence_status === 'paused') {
+    await pool.execute(
+      'INSERT INTO send_logs (scheduled_email_id, mailbox_id, status, message) VALUES (?, ?, ?, ?)',
+      [row.id, row.mailbox_id, 'skipped', 'sequence paused'],
+    );
+    return;
+  }
+
   if (row.prospect_status !== 'active') {
     await pool.execute(
       "UPDATE scheduled_emails SET status='skipped' WHERE id=?",
@@ -81,11 +92,9 @@ export async function processSendJob(job: Job<SendJob>): Promise<void> {
     throw new Error(`rate_limited:${check.reason}`);
   }
 
-  await pool.execute(
-    'INSERT INTO send_logs (scheduled_email_id, mailbox_id, status, message) VALUES (?, ?, ?, ?)',
-    [row.id, row.mailbox_id, 'sent', 'Email dispatched'],
-  );
-
+  // BUG FIX: Moved send_log insert AFTER the actual send() call.
+  // Previously, a 'sent' log was written BEFORE send() was called, so if
+  // send() threw (5% random failure), the audit trail falsely said "sent".
   try {
     await send({
       from: row.mailbox_email,
@@ -93,15 +102,24 @@ export async function processSendJob(job: Job<SendJob>): Promise<void> {
       subject: row.subject,
       body: row.body,
     });
+
     await pool.execute(
       "UPDATE scheduled_emails SET status='sent', sent_at=NOW() WHERE id = ?",
       [row.id],
+    );
+    await pool.execute(
+      'INSERT INTO send_logs (scheduled_email_id, mailbox_id, status, message) VALUES (?, ?, ?, ?)',
+      [row.id, row.mailbox_id, 'sent', 'Email dispatched'],
     );
   } catch (err) {
     const message = (err as Error).message;
     await pool.execute(
       "UPDATE scheduled_emails SET status='failed', last_error=? WHERE id = ?",
       [message, row.id],
+    );
+    await pool.execute(
+      'INSERT INTO send_logs (scheduled_email_id, mailbox_id, status, message) VALUES (?, ?, ?, ?)',
+      [row.id, row.mailbox_id, 'failed', message],
     );
     throw err;
   }

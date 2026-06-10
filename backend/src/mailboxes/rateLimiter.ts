@@ -39,9 +39,13 @@ export async function getMailbox(mailboxId: number): Promise<Mailbox | null> {
 }
 
 /**
- * Check whether the mailbox can send another email right now, and if so,
- * increment the counter. Returns { allowed: false } when a limit would be
- * crossed.
+ * Atomically check whether the mailbox can send another email right now, and
+ * if so, increment the counter. Uses Redis MULTI/EXEC to prevent TOCTOU races
+ * where two concurrent workers both read the same count and both pass the check.
+ *
+ * BUG FIXES applied:
+ *  - Was using separate GET + INCR (race condition under concurrency)
+ *  - Was using `>` instead of `>=` (allowed limit+1 sends)
  */
 export async function checkAndIncrement(mailboxId: number): Promise<CheckResult> {
   const mailbox = await getMailbox(mailboxId);
@@ -50,19 +54,32 @@ export async function checkAndIncrement(mailboxId: number): Promise<CheckResult>
   const dKey = dayKey(mailboxId);
   const hKey = hourKey(mailboxId);
 
-  const dailyRaw = await redis.get(dKey);
-  const hourlyRaw = await redis.get(hKey);
-  const dailyCount = parseInt(dailyRaw ?? '0', 10);
-  const hourlyCount = parseInt(hourlyRaw ?? '0', 10);
+  // Atomic check-and-increment using MULTI/EXEC
+  const pipeline = redis.multi();
+  pipeline.incr(dKey);
+  pipeline.incr(hKey);
+  const results = await pipeline.exec();
 
-  if (dailyCount > mailbox.daily_limit) return { allowed: false, reason: 'daily' };
-  if (hourlyCount > mailbox.hourly_limit) return { allowed: false, reason: 'hourly' };
+  // results is [[error, value], [error, value]]
+  if (!results) return { allowed: false, reason: 'daily' };
 
-  const newDaily = await redis.incr(dKey);
+  const newDaily = results[0]![1] as number;
+  const newHourly = results[1]![1] as number;
+
+  // Set TTL on first creation (value === 1 means key was just created)
   if (newDaily === 1) await redis.expire(dKey, 86400);
-
-  const newHourly = await redis.incr(hKey);
   if (newHourly === 1) await redis.expire(hKey, 3600);
+
+  // Check AFTER increment — if we exceeded the limit, roll back
+  if (newDaily > mailbox.daily_limit) {
+    await redis.decr(dKey);
+    await redis.decr(hKey);
+    return { allowed: false, reason: 'daily' };
+  }
+  if (newHourly > mailbox.hourly_limit) {
+    await redis.decr(hKey);
+    return { allowed: false, reason: 'hourly' };
+  }
 
   return { allowed: true };
 }
@@ -83,13 +100,13 @@ export async function readQuota(mailboxId: number): Promise<QuotaSnapshot | null
 
   let dailyRaw = await redis.get(dKey);
   if (dailyRaw === null) {
-    // Initialize the counter so subsequent reads are stable.
-    await redis.set(dKey, 0);
+    // Initialize the counter with a proper TTL so it doesn't persist forever.
+    await redis.set(dKey, '0', 'EX', 86400);
     dailyRaw = '0';
   }
   let hourlyRaw = await redis.get(hKey);
   if (hourlyRaw === null) {
-    await redis.set(hKey, 0);
+    await redis.set(hKey, '0', 'EX', 3600);
     hourlyRaw = '0';
   }
 
@@ -116,3 +133,6 @@ export async function remainingBudget(mailboxId: number): Promise<{
     hourly: Math.max(0, snapshot.hourly.limit - snapshot.hourly.used),
   };
 }
+
+// Export key generators for testing
+export { dayKey as _dayKey, hourKey as _hourKey };
